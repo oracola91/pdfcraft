@@ -258,6 +258,17 @@ fn scan_content_stream(
                     scan_xobject(ctx, res, holder_ref, name, current_font, depth)?;
                 }
             }
+            b"gs" => {
+                apply_text_op(ctx, res, &op, &mut current_font);
+                if let Some(name) = op.name(0) {
+                    scan_soft_mask(ctx, res, holder_ref, name, depth)?;
+                }
+            }
+            b"scn" | b"SCN" => {
+                if let Some(name) = op.last_name() {
+                    scan_pattern(ctx, res, holder_ref, name, depth)?;
+                }
+            }
             _ => apply_text_op(ctx, res, &op, &mut current_font),
         }
     }
@@ -320,20 +331,73 @@ fn scan_xobject(
 ) -> Result<(), CosError> {
     let xo = res_dict(ctx.doc, res, b"XObject");
     let Some(r) = xo.get(name).and_then(Object::as_ref) else { return Ok(()) };
-    let obj = ctx.doc.get(r);
-    let Object::Stream(s) = &*obj else { return Ok(()) };
-    if s.dict.name(b"Subtype") != Some(b"Form") {
+    if !matches!(&*ctx.doc.get(r), Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Form")) {
         return Ok(());
     }
-    let form_own_res = s.dict.get(b"Resources").and_then(|ro| ctx.doc.resolve(ro).as_dict().cloned());
-    // A form with resources of its own draws through them; one without draws through its caller's.
-    let through = if form_own_res.is_some() { r } else { holder_ref };
+    scan_stream_object(ctx, res, holder_ref, r, current_font, depth)
+}
+
+/// Scan the tiling pattern `name` that an `scn` or `SCN` operator selects. Its cell is content of
+/// its own and can show glyphs of a font the page lists too. A shading pattern is not a stream and
+/// draws no text.
+fn scan_pattern(ctx: &mut ScanContext<'_>, res: &Dict, holder_ref: ObjRef, name: &[u8], depth: usize) -> Result<(), CosError> {
+    let patterns = res_dict(ctx.doc, res, b"Pattern");
+    let Some(r) = patterns.get(name).and_then(Object::as_ref) else { return Ok(()) };
+    scan_stream_object(ctx, res, holder_ref, r, None, depth)
+}
+
+/// Scan the transparency group of the soft mask that the ExtGState `name` sets: what it shows
+/// shapes the page, so its glyphs are in use.
+fn scan_soft_mask(ctx: &mut ScanContext<'_>, res: &Dict, holder_ref: ObjRef, name: &[u8], depth: usize) -> Result<(), CosError> {
+    let states = res_dict(ctx.doc, res, b"ExtGState");
+    let Some(state) = states.get(name).and_then(|s| ctx.doc.resolve(s).as_dict().cloned()) else { return Ok(()) };
+    let Some(mask) = state.get(b"SMask").and_then(|m| ctx.doc.resolve(m).as_dict().cloned()) else { return Ok(()) };
+    let Some(group) = mask.get(b"G").and_then(Object::as_ref) else { return Ok(()) };
+    scan_stream_object(ctx, res, holder_ref, group, None, depth)
+}
+
+/// Scan the appearance streams of a page's annotations. A comment, stamp or field can show glyphs
+/// of a Type 3 font that the page lists too. An appearance without resources of its own draws
+/// through the page's.
+fn scan_appearances(ctx: &mut ScanContext<'_>, page: &Dict, page_ref: ObjRef, page_res: &Dict) -> Result<(), CosError> {
+    for annot in crate::annots_of(ctx.doc, page) {
+        let Some(ap) = ctx.doc.resolve(&annot).as_dict().and_then(|a| a.get(b"AP").cloned()) else { continue };
+        let Some(ap) = ctx.doc.resolve(&ap).as_dict().cloned() else { continue };
+        for (_, entry) in ap.iter() {
+            // Each entry is one stream, or a dictionary of streams by appearance state.
+            let streams: Vec<ObjRef> = match &*ctx.doc.resolve(entry) {
+                Object::Dict(states) => states.iter().filter_map(|(_, s)| s.as_ref()).collect(),
+                _ => entry.as_ref().into_iter().collect(),
+            };
+            for r in streams {
+                scan_stream_object(ctx, page_res, page_ref, r, None, 0)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scan a content stream object (a form, a pattern cell, a soft mask group or an appearance), once
+/// per (stream, font, drawing holder). One with resources of its own draws through them; one
+/// without draws through its caller's.
+fn scan_stream_object(
+    ctx: &mut ScanContext<'_>,
+    res: &Dict,
+    holder_ref: ObjRef,
+    r: ObjRef,
+    current_font: Option<FontKey>,
+    depth: usize,
+) -> Result<(), CosError> {
+    let obj = ctx.doc.get(r);
+    let Object::Stream(s) = &*obj else { return Ok(()) };
+    let own_res = s.dict.get(b"Resources").and_then(|ro| ctx.doc.resolve(ro).as_dict().cloned());
+    let through = if own_res.is_some() { r } else { holder_ref };
     if !ctx.seen_forms.insert((r, current_font, through)) {
         return Ok(());
     }
     let data = s.decoded()?;
-    match form_own_res {
-        Some(form_res) => scan_content_stream(ctx, std::slice::from_ref(&data), r, &form_res, current_font, depth + 1),
+    match own_res {
+        Some(own) => scan_content_stream(ctx, std::slice::from_ref(&data), r, &own, current_font, depth + 1),
         None => scan_content_stream(ctx, std::slice::from_ref(&data), holder_ref, res, current_font, depth + 1),
     }
 }
@@ -480,6 +544,7 @@ pub(crate) fn unlink_type3(doc: &mut Document) -> Result<(), RedactError> {
             .unwrap_or_default();
 
         scan_content_stream(&mut ctx, &content, p.obj, &page_res, None, 0)?;
+        scan_appearances(&mut ctx, &p.dict, p.obj, &page_res)?;
     }
 
     // Also scan any surviving form that wasn't reached by page streams directly.
