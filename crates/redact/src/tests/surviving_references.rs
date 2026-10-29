@@ -332,6 +332,66 @@ fn a_type3_glyph_an_annotation_appearance_shows_is_kept() {
     assert!(full_save_holds(&doc, b"PAGE_GLYPH_C"), "the glyph the page still shows was unlinked");
 }
 
+/// The same annotation also has an `/AP` entry no reader draws (`/X`), which shows the redacted
+/// glyph A. It keeps nothing: A's program goes, and B, which the normal appearance shows, stays.
+#[test]
+fn a_type3_glyph_only_an_undrawn_appearance_entry_shows_is_unlinked() {
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources 5 0 R /Annots [7 0 R] >>".to_vec(),
+        stream("", b"BT /T3 10 Tf 10 100 Td (AC) Tj ET"),
+        b"<< /Font << /T3 6 0 R >> >>".to_vec(),
+        type3_abc(10),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [150 200 250 220] /P 3 0 R /DA (/T3 10 Tf 0 g) /AP << /N 8 0 R /X 9 0 R >> >>".to_vec(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /T3 6 0 R >> >>", b"BT /T3 10 Tf 2 5 Td (B) Tj ET"),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 100 20] /Resources << /Font << /T3 6 0 R >> >>", b"BT /T3 10 Tf 2 5 Td (A) Tj ET"),
+        stream("", b"% REDACTED_GLYPH_A"),
+        stream("", b"% APPEARANCE_GLYPH_B"),
+        stream("", b"% PAGE_GLYPH_C"),
+    ]);
+    mark(&mut doc, 0, &[[9.0, 95.0, 14.9, 110.0]], "");
+    assert_eq!(apply(&mut doc, None).unwrap().glyphs, 1);
+    assert!(!full_save_holds(&doc, b"REDACTED_GLYPH_A"), "an undrawn appearance entry kept the redacted glyph program");
+    assert!(full_save_holds(&doc, b"APPEARANCE_GLYPH_B"), "the glyph the normal appearance shows was unlinked");
+    assert!(full_save_holds(&doc, b"PAGE_GLYPH_C"), "the glyph the page still shows was unlinked");
+}
+
+/// An appearance without /Resources shows glyph B of a second Type 3 font, which the page lists
+/// but its content never selects. The appearance draws through the page's resources, so the
+/// rewritten page still lists that font and B's program stays.
+#[test]
+fn a_type3_font_only_an_appearance_without_resources_selects_stays_on_the_page() {
+    let mut doc = pdf(vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 300 300] /Contents 4 0 R /Resources 5 0 R /Annots [8 0 R] >>".to_vec(),
+        stream("", b"BT /T3 10 Tf 10 100 Td (AC) Tj ET"),
+        b"<< /Font << /T3 6 0 R /T4 7 0 R >> >>".to_vec(),
+        type3_abc(10),
+        type3_abc(13),
+        b"<< /Type /Annot /Subtype /FreeText /Rect [150 200 250 220] /P 3 0 R /DA (/T4 10 Tf 0 g) /AP << /N 9 0 R >> >>".to_vec(),
+        stream("/Type /XObject /Subtype /Form /BBox [0 0 100 20]", b"BT /T4 10 Tf 2 5 Td (B) Tj ET"),
+        stream("", b"% REDACTED_GLYPH_A"),
+        stream("", b"% UNUSED_GLYPH_B"),
+        stream("", b"% PAGE_GLYPH_C"),
+        stream("", b"% UNUSED_T4_GLYPH_A"),
+        stream("", b"% APPEARANCE_GLYPH_B"),
+        stream("", b"% UNUSED_T4_GLYPH_C"),
+    ]);
+    mark(&mut doc, 0, &[[9.0, 95.0, 14.9, 110.0]], "");
+    assert_eq!(apply(&mut doc, None).unwrap().glyphs, 1);
+    assert!(!full_save_holds(&doc, b"REDACTED_GLYPH_A"), "the redacted glyph program survived");
+    assert!(full_save_holds(&doc, b"APPEARANCE_GLYPH_B"), "the glyph the appearance shows was unlinked");
+
+    let bytes = write_full(&doc, &SaveOptions::default()).unwrap();
+    let saved = Document::open(Arc::new(bytes)).unwrap();
+    let page = pdfcraft_model::pages(&saved).swap_remove(0);
+    let res = saved.resolve(page.dict.get(b"Resources").unwrap()).as_dict().unwrap().clone();
+    let fonts = saved.resolve(res.get(b"Font").unwrap()).as_dict().unwrap().clone();
+    assert!(fonts.contains(b"T4"), "the page no longer lists the font the appearance selects");
+}
+
 /// The cell of a tiling pattern the page fills with shows glyph B: its program is kept.
 #[test]
 fn a_type3_glyph_a_tiling_pattern_shows_is_kept() {

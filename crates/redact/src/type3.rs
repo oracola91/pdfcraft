@@ -357,20 +357,48 @@ fn scan_soft_mask(ctx: &mut ScanContext<'_>, res: &Dict, holder_ref: ObjRef, nam
 /// through the page's.
 fn scan_appearances(ctx: &mut ScanContext<'_>, page: &Dict, page_ref: ObjRef, page_res: &Dict) -> Result<(), CosError> {
     for annot in crate::annots_of(ctx.doc, page) {
-        let Some(ap) = ctx.doc.resolve(&annot).as_dict().and_then(|a| a.get(b"AP").cloned()) else { continue };
-        let Some(ap) = ctx.doc.resolve(&ap).as_dict().cloned() else { continue };
-        for (_, entry) in ap.iter() {
-            // Each entry is one stream, or a dictionary of streams by appearance state.
-            let streams: Vec<ObjRef> = match &*ctx.doc.resolve(entry) {
-                Object::Dict(states) => states.iter().filter_map(|(_, s)| s.as_ref()).collect(),
-                _ => entry.as_ref().into_iter().collect(),
-            };
-            for r in streams {
-                scan_stream_object(ctx, page_res, page_ref, r, None, 0)?;
-            }
+        for r in appearance_streams(ctx.doc, &annot) {
+            scan_stream_object(ctx, page_res, page_ref, r, None, 0)?;
         }
     }
     Ok(())
+}
+
+/// The streams an annotation can show: its normal, rollover and down appearances (ISO 32000-2
+/// §12.5.5), each one stream or a dictionary of streams by appearance state. Readers draw no
+/// other `/AP` entry, so one can't keep a glyph the page no longer shows.
+fn appearance_streams(doc: &Document, annot: &Object) -> Vec<ObjRef> {
+    let Some(ap) = doc.resolve(annot).as_dict().and_then(|a| a.get(b"AP").cloned()) else { return Vec::new() };
+    let Some(ap) = doc.resolve(&ap).as_dict().cloned() else { return Vec::new() };
+    let mut streams = Vec::new();
+    for key in [b"N", b"R", b"D"] {
+        let Some(entry) = ap.get(key) else { continue };
+        match &*doc.resolve(entry) {
+            Object::Dict(states) => streams.extend(states.iter().filter_map(|(_, s)| s.as_ref())),
+            _ => streams.extend(entry.as_ref()),
+        }
+    }
+    streams
+}
+
+/// The decoded appearance streams of a page's annotations that have no resources of their own:
+/// they draw through the page's, as [`scan_stream_object`] reads them.
+fn resourceless_appearances(doc: &Document, page: &Dict) -> Result<Vec<Vec<u8>>, CosError> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for annot in crate::annots_of(doc, page) {
+        for r in appearance_streams(doc, &annot) {
+            if !seen.insert(r) {
+                continue;
+            }
+            if let Object::Stream(s) = &*doc.get(r)
+                && s.dict.get(b"Resources").is_none_or(|ro| doc.resolve(ro).as_dict().is_none())
+            {
+                out.push(s.decoded()?);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Scan a content stream object (a form, a pattern cell, a soft mask group or an appearance), once
@@ -406,8 +434,9 @@ fn gs_font_object(doc: &Document, state_obj: &Object) -> Option<Object> {
 }
 
 /// Prune Type 3 fonts from a rewritten page or form's `/Resources` dictionary if the rewritten
-/// content no longer draws any text using that font name.
-pub(crate) fn prune_type3_from_resources(doc: &Document, res: &mut Dict, content: &[Vec<u8>]) -> Result<(), CosError> {
+/// content no longer draws any text using that font name. `page` is the page's dictionary when
+/// `res` are a page's resources.
+pub(crate) fn prune_type3_from_resources(doc: &Document, res: &mut Dict, content: &[Vec<u8>], page: Option<&Dict>) -> Result<(), CosError> {
     let mut fonts = res_dict(doc, res, b"Font");
     if fonts.is_empty() {
         return Ok(());
@@ -415,7 +444,16 @@ pub(crate) fn prune_type3_from_resources(doc: &Document, res: &mut Dict, content
 
     // The operators of forms that draw through these resources count too: dropping a font a child
     // form still shows would leave its text without one.
-    let ops = crate::interp::resource_ops(doc, res, content)?;
+    let mut ops = crate::interp::resource_ops(doc, res, content)?;
+    // So do those of a page's annotation appearances without resources of their own. They are
+    // read only when there is a Type 3 font to keep, so other files are not refused over them.
+    if let Some(page) = page
+        && fonts.iter().any(|(_, f)| doc.resolve(f).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Type3")))
+    {
+        for data in resourceless_appearances(doc, page)? {
+            ops.extend(crate::interp::resource_ops(doc, res, std::slice::from_ref(&data))?);
+        }
+    }
 
     let mut drawn_font_names = HashSet::new();
     for op in &ops {
