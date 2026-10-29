@@ -7,8 +7,13 @@
 //! line reaches the right edge of the page's text with the one that starts just below it at the
 //! same left edge, in the same size: the text wrapped there. Headings, list items, a line that
 //! ends a sentence and a line with paragraph space after it stay apart.
+//!
+//! A list item's bullet is often a block of its own: drawn in a symbol font, a tab stop before
+//! the item's text. Table detection read such a list as a two-column table, bullets in one
+//! column and the items in the other. [`bullet_items`] pairs each bullet with its text, so the
+//! text runs on from its bullet and the bullets stay out of table detection.
 
-use super::layout::Run;
+use super::layout::{Block, Run};
 
 /// Bullets that mark a list item wherever they stand, including the Symbol and Wingdings bullets
 /// Word writes into its PDFs (U+F0B7, U+F0A7).
@@ -34,10 +39,78 @@ const FULL_LINE: (f64, f64) = (3.0, 0.12);
 /// it and still be at the same left edge.
 const SAME_LEFT: f64 = 2.0;
 
+/// How far after its bullet (as a multiple of the bullet's size) a list item's text may start: a
+/// tab stop away.
+const BULLET_GAP: f64 = 3.0;
+
+/// How many blocks [`bullet_items`] may look at on one page, so that a page of many bullets stays
+/// quick; past it, the bullets left are not taken for bullets.
+const BULLET_BUDGET: usize = 1_000_000;
+
+/// Takes a step from `budget`: whether there was one left.
+fn step(budget: &mut usize) -> bool {
+    budget.checked_sub(1).map(|left| *budget = left).is_some()
+}
+
 /// Whether two boxes ([x0, y0, x1, y1]) share a line: they overlap vertically by more than half
 /// the shorter one, as `layout::continued_from` has it.
 fn on_one_line(a: [f64; 4], b: [f64; 4]) -> bool {
     a[3].min(b[3]) - a[1].max(b[1]) > 0.5 * (a[3] - a[1]).min(b[3] - b[1])
+}
+
+/// Whether a block is a bullet drawn on its own: one bullet, dash or middle dot, no wider than one
+/// and a half times its size.
+fn is_bullet(b: &Block) -> bool {
+    let mut chars = b.text.trim().chars();
+    let (Some(c), None) = (chars.next(), chars.next()) else { return false };
+    (BULLETS.contains(&c) || DASHES.contains(&c)) && b.rect[2] - b.rect[0] <= 1.5 * b.size
+}
+
+/// Whether no other block on `blocks[i]`'s line starts left of it. Each block looked at takes a
+/// step from `budget`; when the budget runs out the answer is no.
+fn opens_line(i: usize, blocks: &[Block], budget: &mut usize) -> bool {
+    let Some(a) = blocks.get(i) else { return false };
+    for (j, b) in blocks.iter().enumerate() {
+        if !step(budget) {
+            return false;
+        }
+        if j != i && b.rect[0] < a.rect[0] && on_one_line(a.rect, b.rect) {
+            return false;
+        }
+    }
+    true
+}
+
+/// The list items of a page whose bullet is a block of its own, as (bullet, text): the text is the
+/// block that starts nearest after the bullet on its line, within [`BULLET_GAP`] times its size.
+/// A dash or a middle dot is a bullet only when it opens its line; inside a line it is
+/// punctuation, or a table cell's "none". The items' texts of a list all start at one tab stop,
+/// so the search looks through every block that starts there, within [`BULLET_BUDGET`].
+pub(crate) fn bullet_items(blocks: &[Block]) -> Vec<(usize, usize)> {
+    let mut by_start: Vec<(f64, usize)> = blocks.iter().enumerate().map(|(i, b)| (b.rect[0], i)).collect();
+    by_start.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut budget = BULLET_BUDGET;
+    let mut out = Vec::new();
+    for (ai, a) in blocks.iter().enumerate().filter(|(_, b)| is_bullet(b)) {
+        // The text may start a point inside the bullet's box, as a run that continues another can.
+        let k = by_start.partition_point(|(x, _)| *x < a.rect[2] - 1.0);
+        let text = by_start
+            .get(k..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|(x, _)| *x <= a.rect[2] + BULLET_GAP * a.size)
+            .take_while(|_| step(&mut budget))
+            .filter(|(_, bi)| *bi != ai)
+            .filter_map(|(_, bi)| blocks.get(*bi).map(|b| (*bi, b)))
+            .find(|(_, b)| on_one_line(a.rect, b.rect) && (a.rotation - b.rotation).abs() <= 0.1 && !is_bullet(b))
+            .map(|(bi, _)| bi);
+        let Some(text) = text else { continue };
+        let dash = a.text.trim().chars().next().is_some_and(|c| DASHES.contains(&c));
+        if !dash || opens_line(ai, blocks, &mut budget) {
+            out.push((ai, text));
+        }
+    }
+    out
 }
 
 /// Whether `text` opens like a list item: a bullet, a dash or `*`; one to three digits followed

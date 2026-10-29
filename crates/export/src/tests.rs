@@ -976,3 +976,92 @@ fn joining_lines_survives_hostile_boxes() {
         }
     }
 }
+
+/// A bulleted list as Word and LibreOffice draw one: each bullet a block of its own in a symbol
+/// font, a tab stop before its item's text, between a lead-in line and the next paragraph.
+fn bulleted_list(bullet: &str) -> Vec<Block> {
+    let mut blocks = vec![line("The tenant looks after:", 72.0, 180.0, 700.0)];
+    for (n, (text, end)) in
+        [("the stairs and the landing;", 230.0), ("the shared yard and its gate;", 240.0), ("the bins, every week.", 200.0)].into_iter().enumerate()
+    {
+        let y = 686.0 - 14.0 * n as f64;
+        blocks.push(line(bullet, 90.0, 94.6, y));
+        blocks.push(line(text, 108.0, end, y));
+    }
+    blocks.push(line("Rent is paid monthly in advance.", 72.0, 230.0, 630.0));
+    blocks
+}
+
+/// A bulleted list whose bullets are blocks of their own is one paragraph per item, each item's
+/// text after its bullet, in every format: not a two-column table of bullets and text. The
+/// Symbol and Wingdings bullets Word writes count, and so does a dash that opens its line.
+#[test]
+fn a_bulleted_list_is_paragraphs_not_a_table() {
+    for bullet in ["•", "\u{F0B7}", "\u{F0A7}", "\u{2013}"] {
+        let p = Page { width: 612.0, height: 792.0, blocks: bulleted_list(bullet), ..Page::default() };
+        let (found, _) = tables(&p.blocks);
+        assert!(found.is_empty(), "{bullet}: {found:?}");
+        let items = ["the stairs and the landing;", "the shared yard and its gate;", "the bins, every week."].map(|t| format!("{bullet} {t}"));
+        let mut expected = vec!["The tenant looks after:".to_string()];
+        expected.extend(items.iter().cloned());
+        expected.push("Rent is paid monthly in advance.".into());
+        assert_eq!(word_texts(p.blocks.clone()), expected, "{bullet}");
+        let h = html(std::slice::from_ref(&p), "List");
+        assert!(!h.contains("<table>") && items.iter().all(|i| h.contains(&format!("<p>{i}</p>"))), "{bullet}: {h}");
+        assert!(!rtf(std::slice::from_ref(&p)).contains("\\trowd"), "{bullet}");
+        let s = part(&pptx(std::slice::from_ref(&p), "List"), "ppt/slides/slide1.xml");
+        assert!(!s.contains("<a:tbl>"), "{bullet}: {s}");
+    }
+}
+
+/// A dash in a table row stands for "none": it is a cell like the others, not a bullet, so the
+/// table keeps all its rows.
+#[test]
+fn a_dash_in_a_table_row_stays_a_cell() {
+    let mut blocks = Vec::new();
+    for (n, (name, first, second)) in [("Apples", "\u{2013}", "5"), ("Pears", "3", "4"), ("Plums", "2", "6")].into_iter().enumerate() {
+        let y = 700.0 - 14.0 * n as f64;
+        blocks.push(line(name, 72.0, 110.0, y));
+        blocks.push(line(first, 200.0, 205.0, y));
+        blocks.push(line(second, 225.0, 230.0, y));
+    }
+    let (found, consumed) = tables(&blocks);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].rows.len(), 3, "{found:?}");
+    assert!(consumed.iter().all(|used| *used), "{consumed:?}");
+}
+
+/// A bullet is never a table cell, even when its items carry a second column such as an amount:
+/// every item keeps its bullet in front of its text.
+#[test]
+fn a_bullet_is_never_a_table_cell() {
+    let mut blocks = Vec::new();
+    for (n, (item, amount)) in [("apples", "5 kg"), ("pears", "4 kg"), ("plums", "2 kg")].into_iter().enumerate() {
+        let y = 700.0 - 14.0 * n as f64;
+        blocks.push(line("•", 90.0, 94.6, y));
+        blocks.push(line(item, 108.0, 140.0, y));
+        blocks.push(line(amount, 300.0, 325.0, y));
+    }
+    let (found, _) = tables(&blocks);
+    assert!(found.iter().flat_map(|t| &t.rows).flatten().all(|cell| cell.text != "•"), "{found:?}");
+    let paragraphs = word_texts(blocks);
+    for item in ["• apples", "• pears", "• plums"] {
+        assert!(paragraphs.iter().any(|p| p.starts_with(item)), "{item}: {paragraphs:?}");
+    }
+}
+
+/// Every item of a long list keeps its bullet, though all the items' texts start at one tab stop.
+#[test]
+fn a_long_bulleted_list_keeps_every_bullet_with_its_item() {
+    let mut blocks = Vec::new();
+    for n in 0..150 {
+        let y = 2200.0 - 14.0 * f64::from(n);
+        blocks.push(line("\u{F0B7}", 90.0, 94.6, y));
+        blocks.push(line(&format!("item {n};"), 108.0, 160.0, y));
+    }
+    let (found, _) = tables(&blocks);
+    assert!(found.is_empty(), "{found:?}");
+    let paragraphs = word_texts(blocks);
+    assert_eq!(paragraphs.len(), 150, "{paragraphs:?}");
+    assert!(paragraphs.iter().enumerate().all(|(n, p)| *p == format!("\u{F0B7} item {n};")), "{paragraphs:?}");
+}

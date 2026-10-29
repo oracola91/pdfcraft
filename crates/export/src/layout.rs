@@ -157,11 +157,12 @@ fn continuations(blocks: &[Block]) -> Vec<bool> {
 }
 
 /// Per block, the block it continues on the same line (see [`continuations`]): of those it could
-/// continue, the one that ends nearest to where it starts.
+/// continue, the one that ends nearest to where it starts. A list item's text continues its
+/// bullet, a tab stop before it (`flow::bullet_items`).
 fn continued_from(blocks: &[Block]) -> Vec<Option<usize>> {
     let mut by_end: Vec<(f64, usize)> = blocks.iter().enumerate().map(|(i, b)| (b.rect[2], i)).collect();
     by_end.sort_by(|a, b| a.0.total_cmp(&b.0));
-    blocks
+    let mut from: Vec<Option<usize>> = blocks
         .iter()
         .enumerate()
         .map(|(bi, b)| {
@@ -177,7 +178,13 @@ fn continued_from(blocks: &[Block]) -> Vec<Option<usize>> {
                 .min_by(|(_, a), (_, c)| (a.rect[2] - b.rect[0]).abs().total_cmp(&(c.rect[2] - b.rect[0]).abs()))
                 .map(|(ai, _)| ai)
         })
-        .collect()
+        .collect();
+    for (bullet, text) in super::flow::bullet_items(blocks) {
+        if let Some(slot @ None) = from.get_mut(text) {
+            *slot = Some(bullet);
+        }
+    }
+    from
 }
 
 /// A gap between two runs wider than this (as a fraction of the font size) is a word space the
@@ -270,8 +277,16 @@ fn is_cell_like(b: &Block) -> bool {
 /// per block, whether a table consumed it (so `items` can drop it from the paragraph flow).
 pub(crate) fn tables(blocks: &[Block]) -> (Vec<Table>, Vec<bool>) {
     let mut consumed = vec![false; blocks.len()];
+    // A list's bullets are not cells: beside their items' text they read as a two-column table.
+    let mut bullet = vec![false; blocks.len()];
+    for (i, _) in super::flow::bullet_items(blocks) {
+        if let Some(b) = bullet.get_mut(i) {
+            *b = true;
+        }
+    }
+    let cell_like = |i: usize, b: &Block| is_cell_like(b) && !bullet.get(i).copied().unwrap_or(false);
     // Candidate columns: cluster the left edges of cell-like blocks.
-    let mut xs: Vec<(f64, usize)> = blocks.iter().enumerate().filter(|(_, b)| is_cell_like(b)).map(|(i, b)| (b.rect[0], i)).collect();
+    let mut xs: Vec<(f64, usize)> = blocks.iter().enumerate().filter(|(i, b)| cell_like(*i, b)).map(|(i, b)| (b.rect[0], i)).collect();
     xs.sort_by(|a, b| a.0.total_cmp(&b.0));
     let mut cols: Vec<(f64, Vec<usize>)> = Vec::new(); // (left edge, member block indices)
     for (x, i) in xs {
@@ -307,7 +322,7 @@ pub(crate) fn tables(blocks: &[Block]) -> (Vec<Table>, Vec<bool>) {
     order.sort_by(|a, b| blocks[*b].rect[3].total_cmp(&blocks[*a].rect[3]).then(blocks[*a].rect[0].total_cmp(&blocks[*b].rect[0])));
     for &bi in &order {
         let b = &blocks[bi];
-        if !is_cell_like(b) {
+        if !cell_like(bi, b) {
             continue;
         }
         let Some(ci) = column_at(b.rect[0]) else { continue };
