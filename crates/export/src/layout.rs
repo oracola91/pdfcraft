@@ -138,9 +138,20 @@ const INLINE_GAP: f64 = 0.5;
 /// page laid out so that many end at the same place stays quick.
 const CONTINUATION_PROBE: usize = 64;
 
+/// How far (as a fraction of the font size) the block before may end past where a block starts
+/// and still be the one it continues: a slanted italic's box leans into the next word by about a
+/// quarter of its size.
+const OVERHANG: f64 = 0.3;
+
+/// [`OVERHANG`] in points for a block of `size`: at least a point (rounding), at most six.
+fn overhang(size: f64) -> f64 {
+    if size.is_finite() { (OVERHANG * size).clamp(1.0, 6.0) } else { 1.0 }
+}
+
 /// Per block, whether it continues another on the same line: it starts where that one ends (up to
-/// [`INLINE_GAP`] later, or a point earlier for rounding), so it is the same line of text running
-/// on (a link inside a sentence, a superscript), not a cell of its own.
+/// [`INLINE_GAP`] later, or up to [`overhang`] earlier, as a slanted italic leans into the word
+/// after it), so it is the same line of text running on (a link inside a sentence, a
+/// superscript), not a cell of its own.
 fn continuations(blocks: &[Block]) -> Vec<bool> {
     continued_from(blocks).into_iter().map(|from| from.is_some()).collect()
 }
@@ -159,7 +170,7 @@ fn continued_from(blocks: &[Block]) -> Vec<Option<usize>> {
                 .get(k..)
                 .unwrap_or_default()
                 .iter()
-                .take_while(|(end, _)| *end <= b.rect[0] + 1.0)
+                .take_while(|(end, _)| *end <= b.rect[0] + overhang(b.size))
                 .take(CONTINUATION_PROBE)
                 .filter_map(|(_, ai)| blocks.get(*ai).filter(|_| *ai != bi).map(|a| (*ai, a)))
                 .filter(|(_, a)| a.rect[3].min(b.rect[3]) - a.rect[1].max(b.rect[1]) > 0.5 * (a.rect[3] - a.rect[1]).min(b.rect[3] - b.rect[1]))
@@ -232,6 +243,12 @@ pub(crate) fn paragraphs<'a>(blocks: &'a [Block], skip: &[bool]) -> Vec<Vec<Run<
             runs
         })
         .collect()
+}
+
+/// [`paragraphs`] as the flowing writers lay them out, top to bottom: a paragraph that wraps onto
+/// the next line is joined to it (`flow::join_wrapped`). `body` is the body text size.
+pub(crate) fn flowing_paragraphs<'a>(blocks: &'a [Block], skip: &[bool], body: f64) -> Vec<Vec<Run<'a>>> {
+    super::flow::join_wrapped(paragraphs(blocks, skip), |runs| para_level(runs, body))
 }
 
 /// A paragraph's heading level: the lowest of its runs', so body text that runs on after a bold
@@ -450,8 +467,9 @@ pub(crate) fn items(pages: &[Page]) -> Vec<Item<'_>> {
         }
         let (tables, consumed) = tables(&p.blocks);
         // Blocks and images by their top edge, top to bottom.
-        // A paragraph sits where its first run does: its other runs follow along the same line.
-        let mut parts: Vec<(f64, f64, Item)> = paragraphs(&p.blocks, &consumed)
+        // A paragraph sits where its first run does: its other runs follow along its line and the
+        // lines it wraps onto.
+        let mut parts: Vec<(f64, f64, Item)> = flowing_paragraphs(&p.blocks, &consumed, body)
             .into_iter()
             .filter_map(|runs| {
                 let first = runs.first()?.block;
