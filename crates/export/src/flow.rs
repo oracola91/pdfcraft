@@ -140,7 +140,25 @@ pub(crate) fn list_item(text: &str) -> bool {
 /// paragraph spacing gives no other sign that a paragraph ends there, so such a line is left
 /// apart from the next rather than joined to it wrongly.
 fn ends_sentence(text: &str) -> bool {
-    text.trim_end().trim_end_matches(['"', '\'', '”', '’', '“', '»', ')', ']']).ends_with(['.', '!', '?', ':', ';', '…'])
+    text.trim_end()
+        .trim_end_matches(['"', '\'', '”', '’', '“', '»', ')', ']', '」', '』'])
+        .ends_with(['.', '!', '?', ':', ';', '…', '。', '！', '？'])
+}
+
+/// Whether `c` is of the writing that puts no space between words: Chinese and Japanese
+/// characters, their punctuation and fullwidth forms. A line that wraps between two of them
+/// joins without a word space.
+fn unspaced(c: char) -> bool {
+    matches!(
+        c,
+        '\u{3000}'..='\u{30FF}' // CJK punctuation, Hiragana, Katakana
+            | '\u{31F0}'..='\u{31FF}' // Katakana extension
+            | '\u{3400}'..='\u{4DBF}' // CJK extension A
+            | '\u{4E00}'..='\u{9FFF}' // CJK unified ideographs
+            | '\u{F900}'..='\u{FAFF}' // CJK compatibility ideographs
+            | '\u{FF01}'..='\u{FF9F}' // fullwidth forms, halfwidth Katakana
+            | '\u{20000}'..='\u{3FFFF}' // CJK extension B onwards
+    )
 }
 
 /// `paras` (a page's paragraphs, in any order) top to bottom, with each paragraph that wraps onto
@@ -169,10 +187,15 @@ pub(crate) fn join_wrapped<'a>(mut paras: Vec<Vec<Run<'a>>>, level: impl Fn(&[Ru
         match out.last_mut() {
             Some((prev, 0)) if lvl == 0 && wraps_into(prev, &para, [left, right]) => {
                 // The line break was a word space, unless the line ends in a hyphen; the hyphen
-                // stays, as it may belong to the word ("well-known").
+                // stays, as it may belong to the word ("well-known"). Chinese and Japanese text
+                // wraps between characters, with no space.
+                let unspaced_break = |end: &str| {
+                    end.chars().next_back().is_some_and(unspaced) && para.first().and_then(|r| r.text.chars().next()).is_some_and(unspaced)
+                };
                 if let Some(end) = prev.last_mut()
                     && !end.text.ends_with(char::is_whitespace)
                     && !end.text.ends_with('-')
+                    && !unspaced_break(&end.text)
                 {
                     end.text.push(' ');
                 }

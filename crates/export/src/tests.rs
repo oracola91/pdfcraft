@@ -890,6 +890,9 @@ named in the schedule, <em>Blue Finch Studio</em>, who agree as follows to rent 
     );
     let r = rtf(std::slice::from_ref(&p));
     assert_eq!(r.matches("{\\pard").count(), 2, "{r}");
+    let md = markdown(std::slice::from_ref(&p));
+    assert_eq!(md.trim().split("\n\n").count(), 2, "{md}");
+    assert!(md.contains("of 4 Quay Street, and the tenant named in the schedule, "), "{md}");
     // On a slide the last of the paragraphs set largest is the title; the sentence is one paragraph.
     let s = part(&pptx(std::slice::from_ref(&p), "Lease"), "ppt/slides/slide1.xml");
     let slide: Vec<String> =
@@ -924,10 +927,21 @@ fn a_paragraph_breaks_where_its_line_does_not_run_on() {
     let second = |t: &str| line(t, 72.0, 240.0, 686.0);
     assert_eq!(word_texts(vec![first(full), second(next)]), [format!("{full} {next}")]);
     assert_eq!(word_texts(vec![first("Изпълнителят поддържа сървърите и мрежата на"), second("възложителя в работно състояние")]).len(), 1);
+    // Chinese and Japanese wrap between characters: their lines join without a space. Korean
+    // spaces its words, so its lines join with one.
+    let zh = ("本合同自双方签字之日起生效，有效期", "为一年，期满前一个月双方协商续签事宜");
+    assert_eq!(word_texts(vec![first(zh.0), second(zh.1)]), [format!("{}{}", zh.0, zh.1)]);
+    assert_eq!(
+        word_texts(vec![first("この契約は双方が署名した日から"), second("一年間有効とする")]),
+        ["この契約は双方が署名した日から一年間有効とする"]
+    );
+    assert_eq!(word_texts(vec![first("임차인은 방과 계단을 깨끗하게"), second("유지합니다")]), ["임차인은 방과 계단을 깨끗하게 유지합니다"]);
     let heading = |b: Block| Block { bold: true, ..b };
     for (why, blocks) in [
         ("a sentence ends", vec![first(&format!("{full}.")), second(next)]),
         ("a sentence ends in quotes", vec![first("Страните се договориха „за срок от една година.“"), second(next)]),
+        ("a Chinese sentence ends", vec![first("本合同自双方签字之日起生效。"), second(zh.1)]),
+        ("a Japanese sentence ends in quotes", vec![first("「この契約は一年間有効ですか？」"), second("双方が署名した日から")]),
         ("the line ends short", vec![line(next, 72.0, 240.0, 700.0), line(full, 72.0, 540.0, 686.0)]),
         ("paragraph space", vec![first(full), line(next, 72.0, 240.0, 676.0)]),
         ("an indent", vec![first(full), line(next, 90.0, 258.0, 686.0)]),
