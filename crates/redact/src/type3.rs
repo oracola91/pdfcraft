@@ -401,6 +401,50 @@ fn resourceless_appearances(doc: &Document, page: &Dict) -> Result<Vec<Vec<u8>>,
     Ok(out)
 }
 
+/// Add to `ops` those of the tiling patterns and soft mask groups without resources of their own
+/// that `ops` select (`scn`, `SCN`, `gs`), and of the forms and further ones those draw in turn:
+/// they draw through `res`, as [`scan_stream_object`] reads them. The forms that the first `known`
+/// operators draw are in `ops` already.
+fn add_pattern_and_mask_ops(doc: &Document, res: &Dict, ops: &mut Vec<pdfcraft_content::Op>, known: usize) -> Result<(), CosError> {
+    let xobjects = res_dict(doc, res, b"XObject");
+    let patterns = res_dict(doc, res, b"Pattern");
+    let states = res_dict(doc, res, b"ExtGState");
+    let mut seen = HashSet::new();
+    let mut cursor = 0;
+    while let Some(op) = ops.get(cursor) {
+        let selected = match op.op.as_slice() {
+            b"scn" | b"SCN" => op.last_name().and_then(|n| patterns.get(n)).and_then(Object::as_ref),
+            b"gs" => op
+                .name(0)
+                .and_then(|n| states.get(n))
+                .and_then(|s| doc.resolve(s).as_dict().and_then(|s| s.get(b"SMask").cloned()))
+                .and_then(|m| doc.resolve(&m).as_dict().and_then(|m| m.get(b"G").and_then(Object::as_ref))),
+            b"Do" if cursor >= known => op
+                .last_name()
+                .and_then(|n| xobjects.get(n))
+                .and_then(Object::as_ref)
+                .filter(|r| matches!(&*doc.get(*r), Object::Stream(s) if s.dict.name(b"Subtype") == Some(b"Form"))),
+            _ => None,
+        };
+        cursor += 1;
+        let Some(r) = selected else { continue };
+        if !seen.insert(r) {
+            continue;
+        }
+        let obj = doc.get(r);
+        let Object::Stream(s) = &*obj else { continue };
+        if s.dict.get(b"Resources").is_some_and(|ro| doc.resolve(ro).as_dict().is_some()) {
+            continue;
+        }
+        let parsed = pdfcraft_content::parse(&s.decoded()?);
+        if parsed.skipped > 0 || ops.len().saturating_add(parsed.ops.len()) > 2_000_000 {
+            return Err(CosError::Syntax { offset: 0, detail: "redaction could not fully inspect pattern or soft mask content".into() });
+        }
+        ops.extend(parsed.ops);
+    }
+    Ok(())
+}
+
 /// Scan a content stream object (a form, a pattern cell, a soft mask group or an appearance), once
 /// per (stream, font, drawing holder). One with resources of its own draws through them; one
 /// without draws through its caller's.
@@ -445,14 +489,17 @@ pub(crate) fn prune_type3_from_resources(doc: &Document, res: &mut Dict, content
     // The operators of forms that draw through these resources count too: dropping a font a child
     // form still shows would leave its text without one.
     let mut ops = crate::interp::resource_ops(doc, res, content)?;
-    // So do those of a page's annotation appearances without resources of their own. They are
-    // read only when there is a Type 3 font to keep, so other files are not refused over them.
-    if let Some(page) = page
-        && fonts.iter().any(|(_, f)| doc.resolve(f).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Type3")))
-    {
-        for data in resourceless_appearances(doc, page)? {
-            ops.extend(crate::interp::resource_ops(doc, res, std::slice::from_ref(&data))?);
+    // So do those of a page's annotation appearances, and of tiling patterns and soft mask groups,
+    // without resources of their own. They are read only when there is a Type 3 font to keep, so
+    // other files are not refused over them.
+    if fonts.iter().any(|(_, f)| doc.resolve(f).as_dict().is_some_and(|d| d.name(b"Subtype") == Some(b"Type3"))) {
+        if let Some(page) = page {
+            for data in resourceless_appearances(doc, page)? {
+                ops.extend(crate::interp::resource_ops(doc, res, std::slice::from_ref(&data))?);
+            }
         }
+        let known = ops.len();
+        add_pattern_and_mask_ops(doc, res, &mut ops, known)?;
     }
 
     let mut drawn_font_names = HashSet::new();
